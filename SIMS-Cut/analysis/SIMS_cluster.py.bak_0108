@@ -1,0 +1,316 @@
+from utils import *
+
+def SIMS_cluster(train_x,cell_idx,k,save_path,true_y=None):
+
+	# save_path = '/home/yzy/bioSIMS/data/process/cluster/'
+        mid_path = save_path+'mid/'
+        rst_path = save_path+'rst/'
+        time_str = time.strftime("%Y%m%d%H%M%S")
+
+        print('mkdir {0}...'.format(save_path))
+        if not os.path.exists(save_path):
+                os.makedirs(save_path)
+                print('done!')
+        else:
+                print('{0} already exists!'.format(save_path))
+
+
+
+        print('mkdir {0}...'.format(mid_path))
+        if not os.path.exists(mid_path):
+                os.makedirs(mid_path)
+                print('done!')
+        else:
+                print('{0} already exists!'.format(mid_path))
+
+        print('mkdir {0}...'.format(rst_path))
+        if not os.path.exists(rst_path):
+                os.makedirs(rst_path)
+                print('done!')
+        else:
+                print('{0} already exists!'.format(rst_path))
+
+
+
+
+        start_time = timeit.default_timer()
+	# eng.quit()
+        print('starting matlab engine...')
+        eng = matlab.engine.start_matlab()
+        print('done!')
+	# k=-8
+	# true_y = None
+
+#         train_x是不经过任何处理的train_x
+#         如果k<-1，就取估计一个最好的
+#         先准备representation_list
+        if true_y is None:
+                true_y = np.zeros(shape=(np.max(cell_idx),))
+        train_x_original = train_x
+        num_cells = np.max(cell_idx)
+        representation_list = []
+        rep_name_list = []
+        print('preparing total mean reprentation...')
+        start = timeit.default_timer()
+#         先准备一个total
+        train_x_total = train_x/np.sum(train_x_original,axis=1,keepdims=True)
+        train_x_total = np.log(train_x_total+1)
+        mean_profile_list_total = []
+        for i in range(num_cells):
+                mean_profile_list_total.append(np.mean(train_x_total[cell_idx==i+1,:],axis=0))
+        mean_profile_list_total = np.array(mean_profile_list_total)
+        representation_list.append(mean_profile_list_total)
+        rep_name_list.append('total_mean')
+        stop = timeit.default_timer()
+        print('done! Time cost: ',stop-start)
+        #
+#         再准备三个median
+        perc_list = [50,70,90]
+        for perc in perc_list:
+                print('preparing {0}percentile median mean reprentation...'.format(perc))
+                start = timeit.default_timer()
+                
+                train_x_median = (train_x+1)/(np.percentile(train_x_original,perc,axis=1,keepdims=True)+1)
+                train_x_median = np.log(train_x_median+1)
+                mean_profile_list_median = []
+                for i in range(num_cells):
+                        mean_profile_list_median.append(np.mean(train_x_median[cell_idx==i+1,:],axis=0))
+                mean_profile_list_median = np.array(mean_profile_list_median)
+                representation_list.append(mean_profile_list_median)
+                rep_name_list.append('{0}median_mean'.format(perc))
+                
+                stop = timeit.default_timer()
+                print('done! Time cost: ',stop-start)
+        
+#         再准备distill
+        print('preparing SIMS-id reprentation...')
+        start = timeit.default_timer()
+        SIMS_id_t_list = [5,10,15,20,25,30,35,40,50]
+        SIMS_id_name_list = list(map(lambda x:str(x)+'SIMS_id',SIMS_id_t_list))
+
+        train_x_l1 = Normalizer(norm='l1').fit_transform(train_x)
+        rep_list = get_distil_rep(train_x_l1,cell_idx,num_cells,SIMS_id_t_list, verbose=False,epochs=300)
+        representation_list.extend(rep_list)
+        
+        rep_name_list.extend(SIMS_id_name_list)
+        stop = timeit.default_timer()
+        print('done! Time cost: ',stop-start)
+
+
+        cur_save_file = '{0}rep_dict_{1}.pkl'.format(mid_path,time_str)
+        print('saving representation list to {0}'.format(cur_save_file))
+        rep_dict = dict(zip(rep_name_list,representation_list))
+        pickle.dump(rep_dict,open(cur_save_file,"wb"))
+        print('done!')
+
+        label_list = []
+        CM_list = []
+        label_name_list = []
+        label_ari_list = []
+        for rep_idx in range(len(representation_list)):
+                rep = representation_list[rep_idx]
+                rep_name = rep_name_list[rep_idx]
+                #         先是SC3
+                print('SC3 clustering in {0}...'.format(rep_name))
+                start = timeit.default_timer()
+                label_SC3 = SC3(rep,k)
+                stop = timeit.default_timer()
+                ari = adjusted_mutual_info_score(true_y,label_SC3)
+                label_ari_list.append(ari)
+                print('done! Time cost: ',stop-start,'ari: ',ari,'k: ',np.unique(label_SC3))
+
+                print('SIMLR clustering in {0}...'.format(rep_name))
+                start = timeit.default_timer()
+                label_SIMLR = SIMLR(rep,k)
+                stop = timeit.default_timer()
+                ari = adjusted_mutual_info_score(true_y,label_SIMLR)
+                label_ari_list.append(ari)
+                print('done! Time cost: ',stop-start,'ari: ',ari,'k: ',np.unique(label_SIMLR))
+
+                print('umap_euclidean clustering in {0}...'.format(rep_name))
+                start = timeit.default_timer()
+                umap_embed_euc = umap.UMAP(n_components=10,metric='euclidean',n_neighbors=30,min_dist=0).fit_transform(rep)
+                label_umap_euc = hdbscan.HDBSCAN(min_cluster_size=10).fit_predict(umap_embed_euc)
+                stop = timeit.default_timer()
+                ari = adjusted_mutual_info_score(true_y,label_umap_euc)
+                label_ari_list.append(ari)
+                print('done! Time cost: ',stop-start,'ari: ',ari,'k: ',np.unique(label_umap_euc))
+                
+                print('umap_cosine clustering in {0}...'.format(rep_name))
+                start = timeit.default_timer()
+                umap_embed_cos = umap.UMAP(n_components=10,metric='cosine',n_neighbors=30,min_dist=0).fit_transform(rep)
+                label_umap_cos = hdbscan.HDBSCAN(min_cluster_size=10).fit_predict(umap_embed_cos)
+                stop = timeit.default_timer()
+                ari = adjusted_mutual_info_score(true_y,label_umap_cos)
+                label_ari_list.append(ari)
+                print('done! Time cost: ',stop-start,'ari: ',ari,'k: ',np.unique(label_umap_cos))
+             
+                print('umap_correlation clustering in {0}...'.format(rep_name))
+                start = timeit.default_timer()
+                umap_embed_cor = umap.UMAP(n_components=10,metric='correlation',n_neighbors=30,min_dist=0).fit_transform(rep)
+                label_umap_cor = hdbscan.HDBSCAN(min_cluster_size=10).fit_predict(umap_embed_cor)
+                stop = timeit.default_timer()
+                ari = adjusted_mutual_info_score(true_y,label_umap_cor)
+                label_ari_list.append(ari)
+                print('done! Time cost: ',stop-start,'ari: ',ari,'k: ',np.unique(label_umap_cor))
+             
+                label_list.append(label_SC3)
+                CM_list.append(label2CM(label_SC3))
+                label_name_list.append(rep_name+'_SC3')
+                
+                label_list.append(label_SIMLR)
+                CM_list.append(label2CM(label_SIMLR))
+                label_name_list.append(rep_name+'_SIMLR')
+                
+                label_list.append(label_umap_euc)
+                CM_list.append(label2CM(label_umap_euc))
+                label_name_list.append(rep_name+'_UEUC')
+                
+                label_list.append(label_umap_cos)
+                CM_list.append(label2CM(label_umap_cos))
+                label_name_list.append(rep_name+'_UCOS')
+                
+                label_list.append(label_umap_cor)
+                CM_list.append(label2CM(label_umap_cor))
+                label_name_list.append(rep_name+'_UCOR')
+                
+#         return label_list,CM_list
+
+        cur_save_file = '{0}label_name_dict_{1}.pkl'.format(mid_path,time_str)
+        print('saving label_name_dict to {0}'.format(cur_save_file))
+        label_name_dict = dict(zip(label_name_list,label_list))
+        pickle.dump(label_name_dict,open(cur_save_file,"wb"))
+        print('done!')
+
+        cur_save_file = '{0}CM_name_dict_{1}.pkl'.format(mid_path,time_str)
+        print('saving CM_name_dict to {0}...'.format(cur_save_file))
+        CM_name_dict = dict(zip(label_name_list,CM_list))
+        pickle.dump(CM_name_dict,open(cur_save_file,"wb"))
+        print('done!')
+
+
+        ari_mat = np.zeros(shape=(len(label_list),len(label_list)))
+        for label_idx_i in range(len(label_list)):
+                for label_idx_j in range(len(label_list)):
+                        if label_idx_i==label_idx_j:
+                                if np.sum(true_y)==0:
+                                        cur_ari = 1
+                                else:
+                                        cur_ari = label_ari_list[label_idx_i]
+                        else:
+                                cur_ari = adjusted_mutual_info_score(label_list[label_idx_i],label_list[label_idx_j])
+                        ari_mat[label_idx_i,label_idx_j] = cur_ari
+	
+        cur_save_file = '{0}ARI_mat_{1}.svg'.format(rst_path,time_str)
+        print('saving ARI mat to {0}...'.format(cur_save_file))
+        sns.set(style="white", font_scale=1.5)
+        #sns.clustermap(figsize=(30,30),row_cluster=False,data=pd.DataFrame(ari_mat),col_cluster=False,cmap="vlag",square=True,yticklabels=label_name_list,xticklabels=label_name_list)
+        #plt.savefig(cur_save_file,transparent=True,format='svg')
+        print('done!')
+
+
+
+        print('locally weighted consensus clustering...')
+        start = timeit.default_timer()
+        base_clustering_mat = numpy2mat(np.transpose(np.array(label_list)))
+        consensus_k_range = list(np.arange(2,np.abs(k)+1))
+#         resultsLWEA=eng.compute_LWCM(base_clustering_mat,0.5,matlab.double(consensus_k_range))
+        [resultsLWEA,LWCM]=eng.compute_LWCM(base_clustering_mat,0.5,matlab.double(consensus_k_range),nargout=2)
+        eng.quit()
+        LWCM_np=np.array(LWCM)
+        resultsLWEA = np.array(resultsLWEA)
+        # num_cells*num_labeling
+        stop = timeit.default_timer()
+        print('done! Time cost: ',stop-start)
+
+
+        linkage_mat = hc.linkage(1-LWCM_np, method='complete',optimal_ordering=True)
+	#         order_list.append(leaves_list(linkage_mat))
+	# lut = dict(zip(np.unique(optimal_labeling), cluster_cmp, ))
+	# row_colors = list(pd.DataFrame(optimal_labeling)[0].map(lut))
+	# fill LWCM_np diagonal with maxvalue
+        np.fill_diagonal(LWCM_np,0)
+        for i in range(LWCM_np.shape[0]):
+                LWCM_np[i,i] = np.max(LWCM_np[:,i])
+	
+        cur_save_file = '{0}LWCM_{1}.svg'.format(rst_path,time_str)
+        print('saving LWCM to {0}...'.format(cur_save_file))
+        sns.set(style="white", font_scale=1.5)
+        sns.clustermap(LWCM_np, row_linkage=linkage_mat,col_linkage=linkage_mat,figsize=(30,30),cmap='vlag')
+        plt.savefig(cur_save_file,transparent=True,format='svg')
+        print('done!')
+
+
+
+
+        # 选择最佳的labeling
+        print('choosing optimal k...')
+        start = timeit.default_timer()
+        average_ari_list = np.zeros(shape=(resultsLWEA.shape[1],))
+        for i in range(resultsLWEA.shape[1]):
+                cur_k_labeling = resultsLWEA[:,i]
+                for base_label in label_list:
+                        cur_ari = adjusted_mutual_info_score(cur_k_labeling,base_label)
+                        average_ari_list[i]+=cur_ari
+                average_ari_list[i]/=len(label_list)
+        optimal_k_idx = np.argmax(average_ari_list)
+        optimal_k = optimal_k_idx+2
+        optimal_labeling = resultsLWEA[:,optimal_k_idx]
+        stop = timeit.default_timer()
+        print('done! Time cost: ',stop-start)
+        print('optimal k: ',optimal_k)
+
+
+        final_label_list = []
+        for i in range(resultsLWEA.shape[1]):
+                cur_k_labeling = resultsLWEA[:,i]
+                final_label_list.append(cur_k_labeling)
+                cur_k = i+2
+
+                if np.sum(true_y)!=0:
+                        print('k={0} ari: '.format(str(cur_k)),adjusted_mutual_info_score(cur_k_labeling,true_y))
+
+	        
+                cur_k_labeling-=np.min(cur_k_labeling)
+	        
+	        
+	#         开始画图
+                cluster_cmp = sns.hls_palette(cur_k)
+                labeling_plot_cmp = ['k']
+                labeling_plot_cmp.extend(cluster_cmp)
+	        
+                cur_save_file = '{0}TSNE_k{1}_{2}.svg'.format(rst_path,str(cur_k),time_str)
+                print('saving TSNE_k{0} to {1}...'.format(str(cur_k),cur_save_file))
+                sns.set(style="white", font_scale=1.5)
+                embed_test = TSNE(metric='precomputed').fit_transform(1-LWCM_np)
+	                        # plt.scatter(embed_test[:,0],embed_test[:,1],c=optimal_labeling,cmap=sns.hls_palette(3))
+                sns.scatterplot(x=embed_test[:,0],y=embed_test[:,1],hue=cur_k_labeling,palette=cluster_cmp)
+                plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
+                plt.savefig(cur_save_file,transparent=True,format='svg')
+                print('done!')
+	        
+	        
+	        
+                cur_save_file = '{0}labeling_image_k{1}_{2}.svg'.format(rst_path,str(cur_k),time_str)
+                print('saving labeling_image_k{0} to {1}...'.format(str(cur_k),cur_save_file))
+                labeling = get_labeling(cur_k_labeling-1,cell_idx)
+                labeling_plot = labeling.reshape((256,256))
+                sns.set(font_scale=3)
+                plt.figure(figsize=(30,30))
+                ticks=np.arange(np.min(labeling_plot)+1,np.max(labeling_plot)+1)
+                boundaries = np.arange(np.min(labeling_plot)+0.5,np.max(labeling_plot)+1.5)
+                sns.heatmap(labeling_plot,cmap=labeling_plot_cmp,square=True,cbar_kws={"ticks":ticks, "boundaries":boundaries,'fraction':0.046,'pad':0.04})
+                plt.xticks([])
+                plt.yticks([])
+                plt.tight_layout()
+                plt.savefig(cur_save_file,transparent=True,format='svg')
+	        
+                print('done!')
+        cur_save_file = '{0}final_label_list_{1}.pkl'.format(mid_path,time_str)
+        print('saving final_label_list to {0}'.format(cur_save_file))
+        pickle.dump(final_label_list,open(cur_save_file,"wb"))
+        print('done!')
+        stop_time = timeit.default_timer()
+        print(stop_time-start_time)
+        return optimal_k_idx,final_label_list        
+#         return resultsLWEA,optimal_k_idx 
